@@ -59,7 +59,10 @@ struct xwl_present_event {
     present_vblank_rec vblank;
 
     PixmapPtr pixmap;
-    Bool async_may_tear;
+    Bool released;
+    uint32_t options;
+    uint64_t divisor;
+    uint64_t remainder;
 };
 
 Bool xwl_present_entered_for_each_frame_callback(void);

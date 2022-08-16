@@ -21,6 +21,7 @@
  */
 
 #include "present_priv.h"
+#include <sys/eventfd.h>
 
 /*
  * Called when the wait fence is triggered; just gets the current msc/ust and
@@ -33,6 +34,21 @@ present_wait_fence_triggered(void *param)
     present_vblank_ptr      vblank = param;
     ScreenPtr               screen = vblank->screen;
     present_screen_priv_ptr screen_priv = present_screen_priv(screen);
+
+    screen_priv->re_execute(vblank);
+}
+
+static void present_syncobj_triggered(int fd, int xevents, void *data)
+{
+    present_vblank_ptr vblank = data;
+    ScreenPtr screen = vblank->screen;
+    present_screen_priv_ptr screen_priv = present_screen_priv(screen);
+    uint64_t efd_value;
+
+    read(fd, &efd_value, sizeof (efd_value));
+    SetNotifyFd(fd, NULL, 0, NULL);
+    close(fd);
+    vblank->efd = -1;
 
     screen_priv->re_execute(vblank);
 }
@@ -58,6 +74,16 @@ present_execute_wait(present_vblank_ptr vblank, uint64_t crtc_msc)
             return TRUE;
         }
     }
+
+    if (vblank->acquire_syncobj && !vblank->acquire_syncobj->check(vblank->acquire_syncobj,
+                                                                   vblank->acquire_point)) {
+        vblank->efd = eventfd(0, EFD_CLOEXEC);
+        SetNotifyFd(vblank->efd, present_syncobj_triggered, X_NOTIFY_READ, vblank);
+        vblank->acquire_syncobj->eventfd(vblank->acquire_syncobj, vblank->acquire_point,
+                                         vblank->efd, FALSE /* wait_avail */);
+        return TRUE;
+    }
+
     return FALSE;
 }
 
@@ -85,7 +111,13 @@ present_execute_copy(present_vblank_ptr vblank, uint64_t crtc_msc)
      * which is then freed, freeing the region
      */
     vblank->update = NULL;
-    screen_priv->flush(window);
+    if (vblank->release_syncobj) {
+        int fence_fd = screen_priv->flush_fenced(window);
+        vblank->release_syncobj->import_fence(vblank->release_syncobj,
+                                              vblank->release_point, fence_fd);
+    } else {
+        screen_priv->flush(window);
+    }
 
     present_pixmap_idle(vblank->pixmap, vblank->window, vblank->serial, vblank->idle_fence);
 }

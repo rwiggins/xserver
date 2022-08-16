@@ -151,6 +151,7 @@ Bool xwl_glamor_get_drawable_modifiers(DrawablePtr drawable, uint32_t format,
                                        uint32_t *num_modifiers, uint64_t **modifiers);
 Bool xwl_glamor_check_flip(WindowPtr present_window, PixmapPtr pixmap);
 PixmapPtr xwl_glamor_create_pixmap_for_window (struct xwl_window *xwl_window);
+int xwl_glamor_get_fence(struct xwl_screen *screen);
 
 #ifdef XV
 /* glamor Xv Adaptor */

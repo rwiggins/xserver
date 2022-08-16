@@ -27,6 +27,7 @@
 
 #include <windowstr.h>
 #include <present.h>
+#include <sys/eventfd.h>
 
 #include "xwayland-present.h"
 #include "xwayland-screen.h"
@@ -211,10 +212,18 @@ xwl_present_reset_timer(struct xwl_present_window *xwl_present_window)
 static void
 xwl_present_execute(present_vblank_ptr vblank, uint64_t ust, uint64_t crtc_msc);
 
+static int
+xwl_present_queue_vblank(ScreenPtr screen,
+                         WindowPtr present_window,
+                         RRCrtcPtr crtc,
+                         uint64_t event_id,
+                         uint64_t msc);
+
 static uint32_t
 xwl_present_query_capabilities(present_screen_priv_ptr screen_priv)
 {
-    return XWL_PRESENT_CAPS;
+    struct xwl_screen *xwl_screen = xwl_screen_get(screen_priv->pScreen);
+    return xwl_screen->present_capabilities;
 }
 
 static int
@@ -233,6 +242,16 @@ xwl_present_get_ust_msc(ScreenPtr screen,
     return Success;
 }
 
+static uint64_t
+xwl_present_get_exec_msc(uint32_t options, uint64_t target_msc)
+{
+    /* Synchronous Xwayland presentations always complete (at least) one frame after they
+     * are executed
+     */
+    return (options & PresentOptionAsyncMayTear) ?
+        target_msc : target_msc - 1;
+}
+
 /*
  * When the wait fence or previous flip is completed, it's time
  * to re-try the request
@@ -240,9 +259,27 @@ xwl_present_get_ust_msc(ScreenPtr screen,
 static void
 xwl_present_re_execute(present_vblank_ptr vblank)
 {
+    struct xwl_present_event *event = xwl_present_event_from_vblank(vblank);
     uint64_t ust = 0, crtc_msc = 0;
 
     (void) xwl_present_get_ust_msc(vblank->screen, vblank->window, &ust, &crtc_msc);
+    /* re-compute target / exec msc */
+    vblank->target_msc = present_get_target_msc(0, crtc_msc,
+                                                event->divisor,
+                                                event->remainder,
+                                                event->options);
+    vblank->exec_msc = xwl_present_get_exec_msc(event->options,
+                                                vblank->target_msc);
+
+    vblank->queued = TRUE;
+    if (msc_is_after(vblank->exec_msc, crtc_msc) &&
+        xwl_present_queue_vblank(vblank->screen, vblank->window,
+                                 vblank->crtc,
+                                 vblank->event_id,
+                                 vblank->exec_msc) == Success) {
+        return;
+    }
+
     xwl_present_execute(vblank, ust, crtc_msc);
 }
 
@@ -281,6 +318,10 @@ xwl_present_free_event(struct xwl_present_event *event)
 static void
 xwl_present_free_idle_vblank(present_vblank_ptr vblank)
 {
+    if (vblank->release_syncobj)
+        vblank->release_syncobj->signal(vblank->release_syncobj,
+                                        vblank->release_point);
+
     present_pixmap_idle(vblank->pixmap, vblank->window, vblank->serial, vblank->idle_fence);
     xwl_present_free_event(xwl_present_event_from_vblank(vblank));
 }
@@ -440,6 +481,11 @@ xwl_present_buffer_release(void *data)
         return;
 
     vblank = &event->vblank;
+
+    if (vblank->release_syncobj)
+        vblank->release_syncobj->signal(vblank->release_syncobj,
+                                        vblank->release_point);
+
     present_pixmap_idle(vblank->pixmap, vblank->window, vblank->serial, vblank->idle_fence);
 
     xwl_present_window = xwl_present_window_priv(vblank->window);
@@ -630,6 +676,15 @@ xwl_present_maybe_set_reason(struct xwl_window *xwl_window, PresentFlipReason *r
     }
 }
 
+static int
+xwl_present_flush_fenced(WindowPtr window)
+{
+    struct xwl_window *xwl_window = xwl_window_from_window(window);
+    int fence = xwl_glamor_get_fence(xwl_window->xwl_screen);
+    xwl_present_flush(window);
+    return fence;
+}
+
 static Bool
 xwl_present_check_flip(RRCrtcPtr crtc,
                        WindowPtr present_window,
@@ -797,7 +852,7 @@ xwl_present_flip(present_vblank_ptr vblank, RegionPtr damage)
 
     if (xwl_window->tearing_control) {
         uint32_t hint;
-        if (event->async_may_tear)
+        if (event->options & PresentOptionAsyncMayTear)
             hint = WP_TEARING_CONTROL_V1_PRESENTATION_HINT_ASYNC;
         else
             hint = WP_TEARING_CONTROL_V1_PRESENTATION_HINT_VSYNC;
@@ -838,6 +893,7 @@ xwl_present_execute(present_vblank_ptr vblank, uint64_t ust, uint64_t crtc_msc)
 
     xorg_list_del(&vblank->event_queue);
 
+retry:
     if (present_execute_wait(vblank, crtc_msc))
         return;
 
@@ -898,6 +954,8 @@ xwl_present_execute(present_vblank_ptr vblank, uint64_t ust, uint64_t crtc_msc)
             }
 
             vblank->flip = FALSE;
+            /* re-execute, falling through to copy */
+            goto retry;
         }
         DebugPresent(("\tc %p %" PRIu64 ": %08" PRIx32 " -> %08" PRIx32 "\n",
                       vblank, crtc_msc, vblank->pixmap->drawable.id, vblank->window->drawable.id));
@@ -934,6 +992,10 @@ xwl_present_pixmap(WindowPtr window,
                    RRCrtcPtr target_crtc,
                    SyncFence *wait_fence,
                    SyncFence *idle_fence,
+                   struct dri3_syncobj *acquire_syncobj,
+                   struct dri3_syncobj *release_syncobj,
+                   uint64_t acquire_point,
+                   uint64_t release_point,
                    uint32_t options,
                    uint64_t target_window_msc,
                    uint64_t divisor,
@@ -950,10 +1012,16 @@ xwl_present_pixmap(WindowPtr window,
     ScreenPtr                   screen = window->drawable.pScreen;
     present_window_priv_ptr     window_priv = present_get_window_priv(window, TRUE);
     present_screen_priv_ptr     screen_priv = present_screen_priv(screen);
+    struct xwl_screen          *xwl_screen = xwl_screen_get(screen_priv->pScreen);
+    uint32_t                    caps = xwl_screen->present_capabilities;
     struct xwl_present_event *event;
 
     if (!window_priv)
         return BadAlloc;
+
+    if (!(caps & PresentCapabilitySyncobj) &&
+        (acquire_syncobj || release_syncobj))
+        return BadValue;
 
     target_crtc = xwl_present_get_crtc(screen_priv, window);
 
@@ -989,6 +1057,10 @@ xwl_present_pixmap(WindowPtr window,
             if (vblank->target_msc != target_msc)
                 continue;
 
+            if (vblank->release_syncobj)
+                vblank->release_syncobj->signal(vblank->release_syncobj,
+                                                vblank->release_point);
+
             present_vblank_scrap(vblank);
             if (vblank->flip_ready)
                 xwl_present_re_execute(vblank);
@@ -1001,22 +1073,18 @@ xwl_present_pixmap(WindowPtr window,
 
     vblank = &event->vblank;
     if (!present_vblank_init(vblank, window, pixmap, serial, valid, update, x_off, y_off,
-                             target_crtc, wait_fence, idle_fence, options, XWL_PRESENT_CAPS,
-                             notifies, num_notifies, target_msc, crtc_msc)) {
+                             target_crtc, wait_fence, idle_fence,
+                             acquire_syncobj, release_syncobj, acquire_point, release_point,
+                             options, caps, notifies, num_notifies, target_msc, crtc_msc)) {
         present_vblank_destroy(vblank);
         return BadAlloc;
     }
 
     vblank->event_id = ++xwl_present_event_id;
-    event->async_may_tear = options & PresentOptionAsyncMayTear;
-
-    /* Synchronous Xwayland presentations always complete (at least) one frame after they
-     * are executed
-     */
-    if (event->async_may_tear)
-        vblank->exec_msc = vblank->target_msc;
-    else
-        vblank->exec_msc = vblank->target_msc - 1;
+    event->options = options;
+    event->divisor = divisor;
+    event->remainder = remainder;
+    vblank->exec_msc = xwl_present_get_exec_msc(options, vblank->target_msc);
 
     vblank->queued = TRUE;
     if (crtc_msc < vblank->exec_msc) {
@@ -1065,6 +1133,12 @@ xwl_present_init(ScreenPtr screen)
     if (!dixRegisterPrivateKey(&xwl_present_window_private_key, PRIVATE_WINDOW, 0))
         return FALSE;
 
+    xwl_screen->present_capabilities = XWL_PRESENT_CAPS;
+    if (epoxy_has_egl_extension(xwl_screen->egl_display,
+                                "ANDROID_native_fence_sync"))
+        xwl_screen->present_capabilities |=
+            PresentCapabilitySyncobj;
+
     screen_priv->query_capabilities = xwl_present_query_capabilities;
     screen_priv->get_crtc = xwl_present_get_crtc;
 
@@ -1075,6 +1149,7 @@ xwl_present_init(ScreenPtr screen)
     screen_priv->present_pixmap = xwl_present_pixmap;
     screen_priv->queue_vblank = xwl_present_queue_vblank;
     screen_priv->flush = xwl_present_flush;
+    screen_priv->flush_fenced = xwl_present_flush_fenced;
     screen_priv->re_execute = xwl_present_re_execute;
 
     screen_priv->abort_vblank = xwl_present_abort_vblank;
