@@ -48,7 +48,7 @@
 
 /* DRI3 */
 #define SERVER_DRI3_MAJOR_VERSION               1
-#define SERVER_DRI3_MINOR_VERSION               3
+#define SERVER_DRI3_MINOR_VERSION               4
 
 /* DMX */
 #define SERVER_DMX_MAJOR_VERSION		2

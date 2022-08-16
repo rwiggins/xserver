@@ -28,7 +28,33 @@
 #include <X11/extensions/dri3proto.h>
 #include <randrstr.h>
 
-#define DRI3_SCREEN_INFO_VERSION        2
+#define DRI3_SCREEN_INFO_VERSION        4
+
+extern RESTYPE dri3_syncobj_type;
+
+struct dri3_syncobj
+{
+    XID id;
+    ScreenPtr screen;
+    uint32_t refcount;
+
+    void (*free)(struct dri3_syncobj *syncobj);
+    Bool (*check)(struct dri3_syncobj *syncobj, uint64_t point);
+    int (*export_fence)(struct dri3_syncobj *syncobj, uint64_t point);
+    void (*import_fence)(struct dri3_syncobj *syncobj, uint64_t point, int fd);
+    void (*signal)(struct dri3_syncobj *syncobj, uint64_t point);
+    void (*eventfd)(struct dri3_syncobj *syncobj, uint64_t point, int efd, Bool wait_avail);
+};
+
+#define VERIFY_DRI3_SYNCOBJ(id, ptr, a)\
+    do {\
+        int rc = dixLookupResourceByType((void **)&(ptr), id,\
+                                         dri3_syncobj_type, client, a);\
+        if (rc != Success) {\
+            client->errorValue = id;\
+            return rc;\
+        }\
+    } while (0);
 
 typedef int (*dri3_open_proc)(ScreenPtr screen,
                               RRProviderPtr provider,
@@ -84,6 +110,11 @@ typedef int (*dri3_get_drawable_modifiers_proc) (DrawablePtr draw,
                                                  uint32_t *num_modifiers,
                                                  uint64_t **modifiers);
 
+typedef struct dri3_syncobj *(*dri3_import_syncobj_proc) (ClientPtr client,
+                                                          ScreenPtr screen,
+                                                          XID id,
+                                                          int fd);
+
 typedef struct dri3_screen_info {
     uint32_t                    version;
 
@@ -100,6 +131,9 @@ typedef struct dri3_screen_info {
     dri3_get_formats_proc       get_formats;
     dri3_get_modifiers_proc     get_modifiers;
     dri3_get_drawable_modifiers_proc get_drawable_modifiers;
+
+    /* Version 4 */
+    dri3_import_syncobj_proc    import_syncobj;
 
 } dri3_screen_info_rec, *dri3_screen_info_ptr;
 
