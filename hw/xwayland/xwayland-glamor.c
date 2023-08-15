@@ -1060,6 +1060,26 @@ xwl_glamor_needs_n_buffering(struct xwl_screen *xwl_screen)
                 XWL_EGL_BACKEND_NEEDS_N_BUFFERING);
 }
 
+Bool
+xwl_glamor_supports_implicit_sync(struct xwl_screen *xwl_screen)
+{
+    if (!xwl_screen->glamor || !xwl_screen->egl_backend)
+        return FALSE;
+
+    return xwl_screen->egl_backend->backend_flags &
+        XWL_EGL_BACKEND_SUPPORTS_IMPLICIT_SYNC;
+}
+
+Bool
+xwl_glamor_supports_syncobjs(struct xwl_screen *xwl_screen)
+{
+    if (!xwl_screen->glamor || !xwl_screen->egl_backend)
+        return FALSE;
+
+    return xwl_screen->egl_backend->backend_flags &
+        XWL_EGL_BACKEND_SUPPORTS_SYNCOBJS;
+}
+
 PixmapPtr
 xwl_glamor_create_pixmap_for_window(struct xwl_window *xwl_window)
 {
@@ -1096,6 +1116,70 @@ xwl_glamor_get_fence(struct xwl_screen *xwl_screen)
     }
 
     return fence_fd;
+}
+
+void
+xwl_glamor_wait_fence(struct xwl_screen *xwl_screen, int fence_fd)
+{
+    EGLint attribs[3];
+    EGLSyncKHR sync;
+
+    if (!xwl_screen->glamor)
+        return;
+
+    xwl_glamor_egl_make_current(xwl_screen);
+
+    attribs[0] = EGL_SYNC_NATIVE_FENCE_FD_ANDROID;
+    attribs[1] = fence_fd;
+    attribs[2] = EGL_NONE;
+    sync = eglCreateSyncKHR(xwl_screen->egl_display, EGL_SYNC_NATIVE_FENCE_ANDROID, attribs);
+    if (sync != EGL_NO_SYNC_KHR) {
+        eglWaitSyncKHR(xwl_screen->egl_display, sync, 0);
+        eglDestroySyncKHR(xwl_screen->egl_display, sync);
+    }
+}
+
+int
+xwl_glamor_dmabuf_export_sync_file(PixmapPtr pixmap)
+{
+    ScreenPtr screen = pixmap->drawable.pScreen;
+    struct xwl_screen *xwl_screen = xwl_screen_get(screen);
+
+    if (xwl_screen->glamor && xwl_screen->egl_backend &&
+        xwl_screen->egl_backend->dmabuf_export_sync_file)
+        return xwl_screen->egl_backend->dmabuf_export_sync_file(pixmap);
+
+    return -1;
+}
+
+void
+xwl_glamor_dmabuf_import_sync_file(PixmapPtr pixmap, int sync_file)
+{
+    ScreenPtr screen = pixmap->drawable.pScreen;
+    struct xwl_screen *xwl_screen = xwl_screen_get(screen);
+
+    if (xwl_screen->glamor && xwl_screen->egl_backend &&
+        xwl_screen->egl_backend->dmabuf_import_sync_file)
+        xwl_screen->egl_backend->dmabuf_import_sync_file(pixmap, sync_file);
+}
+
+void
+xwl_glamor_dri3_syncobj_passthrough(WindowPtr window,
+                                    struct dri3_syncobj *acquire_syncobj,
+                                    struct dri3_syncobj *release_syncobj,
+                                    uint64_t acquire_point,
+                                    uint64_t release_point)
+{
+    ScreenPtr screen = window->drawable.pScreen;
+    struct xwl_screen *xwl_screen = xwl_screen_get(screen);
+
+    if (xwl_screen->glamor && xwl_screen->egl_backend &&
+        xwl_screen->egl_backend->dri3_syncobj_passthrough)
+        xwl_screen->egl_backend->dri3_syncobj_passthrough(window,
+                                                          acquire_syncobj,
+                                                          release_syncobj,
+                                                          acquire_point,
+                                                          release_point);
 }
 
 void

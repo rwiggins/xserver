@@ -27,7 +27,6 @@
 
 #include <windowstr.h>
 #include <present.h>
-#include <sys/eventfd.h>
 
 #include "xwayland-present.h"
 #include "xwayland-screen.h"
@@ -36,6 +35,7 @@
 #include "glamor.h"
 
 #include "tearing-control-v1-client-protocol.h"
+#include "linux-drm-syncobj-v1-client-protocol.h"
 
 #define XWL_PRESENT_CAPS PresentCapabilityAsync | PresentCapabilityAsyncMayTear
 
@@ -474,6 +474,7 @@ static void
 xwl_present_buffer_release(void *data)
 {
     struct xwl_present_window *xwl_present_window;
+    struct xwl_screen *xwl_screen;
     struct xwl_present_event *event = data;
     present_vblank_ptr vblank;
 
@@ -482,9 +483,14 @@ xwl_present_buffer_release(void *data)
 
     vblank = &event->vblank;
 
-    if (vblank->release_syncobj)
-        vblank->release_syncobj->signal(vblank->release_syncobj,
-                                        vblank->release_point);
+    xwl_screen = xwl_screen_get(vblank->screen);
+    if (vblank->release_syncobj && !xwl_screen->explicit_sync) {
+        /* transfer implicit fence to release syncobj */
+        int fence_fd = xwl_glamor_dmabuf_export_sync_file(vblank->pixmap);
+        vblank->release_syncobj->import_fence(vblank->release_syncobj,
+                                              vblank->release_point,
+                                              fence_fd);
+    }
 
     present_pixmap_idle(vblank->pixmap, vblank->window, vblank->serial, vblank->idle_fence);
 
@@ -698,6 +704,7 @@ xwl_present_check_flip(RRCrtcPtr crtc,
     WindowPtr toplvl_window = xwl_present_toplvl_pixmap_window(present_window);
     struct xwl_window *xwl_window = xwl_window_from_window(present_window);
     ScreenPtr screen = pixmap->drawable.pScreen;
+    struct xwl_screen *xwl_screen = xwl_screen_get(screen);
 
     if (reason)
         *reason = PRESENT_FLIP_REASON_UNKNOWN;
@@ -732,6 +739,10 @@ xwl_present_check_flip(RRCrtcPtr crtc,
         return FALSE;
 
     if (!xwl_glamor_check_flip(present_window, pixmap))
+        return FALSE;
+
+    if (!xwl_glamor_supports_implicit_sync(xwl_screen) &&
+        !xwl_screen->explicit_sync)
         return FALSE;
 
     /* Can't flip if the window pixmap doesn't match the xwl_window parent
@@ -812,6 +823,7 @@ xwl_present_flip(present_vblank_ptr vblank, RegionPtr damage)
     PixmapPtr pixmap = vblank->pixmap;
     struct xwl_window           *xwl_window = xwl_window_from_window(present_window);
     struct xwl_present_window   *xwl_present_window = xwl_present_window_priv(present_window);
+    struct xwl_screen           *xwl_screen = xwl_window->xwl_screen;
     BoxPtr                      damage_box;
     struct wl_buffer            *buffer;
     struct xwl_present_event    *event = xwl_present_event_from_vblank(vblank);
@@ -830,6 +842,28 @@ xwl_present_flip(present_vblank_ptr vblank, RegionPtr damage)
     pixmap->refcnt++;
 
     event->pixmap = pixmap;
+
+    assert(xwl_glamor_supports_implicit_sync(xwl_screen) ||
+           xwl_screen->explicit_sync);
+
+    if (vblank->acquire_syncobj && vblank->release_syncobj) {
+        if (xwl_screen->explicit_sync)
+            xwl_glamor_dri3_syncobj_passthrough(present_window,
+                                                vblank->acquire_syncobj,
+                                                vblank->release_syncobj,
+                                                vblank->acquire_point,
+                                                vblank->release_point);
+        else {
+            /* transfer from acquire syncobj to implicit fence */
+            int fence_fd =
+                vblank->acquire_syncobj->export_fence(vblank->acquire_syncobj,
+                                                      vblank->acquire_point);
+            xwl_glamor_dmabuf_import_sync_file(vblank->pixmap, fence_fd);
+        }
+    } else if (xwl_window->surface_sync) {
+        wp_linux_drm_syncobj_surface_v1_destroy(xwl_window->surface_sync);
+        xwl_window->surface_sync = NULL;
+    }
 
     xwl_pixmap_set_buffer_release_cb(pixmap, xwl_present_buffer_release, event);
 
@@ -1134,10 +1168,8 @@ xwl_present_init(ScreenPtr screen)
         return FALSE;
 
     xwl_screen->present_capabilities = XWL_PRESENT_CAPS;
-    if (epoxy_has_egl_extension(xwl_screen->egl_display,
-                                "ANDROID_native_fence_sync"))
-        xwl_screen->present_capabilities |=
-            PresentCapabilitySyncobj;
+    if (xwl_glamor_supports_syncobjs(xwl_screen))
+        xwl_screen->present_capabilities |= PresentCapabilitySyncobj;
 
     screen_priv->query_capabilities = xwl_present_query_capabilities;
     screen_priv->get_crtc = xwl_present_get_crtc;

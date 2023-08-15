@@ -110,6 +110,7 @@ struct xwl_screen {
     struct wp_viewporter *viewporter;
     struct xwayland_shell_v1 *xwayland_shell;
     struct wp_tearing_control_manager_v1 *tearing_control_manager;
+    struct wp_linux_drm_syncobj_v1 *explicit_sync;
     struct xorg_list drm_lease_devices;
     struct xorg_list queued_drm_lease_devices;
     struct xorg_list drm_leases;
@@ -146,6 +147,12 @@ struct xwl_screen {
 #endif
 
     uint32_t present_capabilities;
+
+    /* For use with explicit sync */
+    struct dri3_syncobj *glamor_syncobj;
+    struct dri3_syncobj *server_syncobj;
+    uint64_t glamor_timeline_point;
+    uint64_t server_timeline_point;
 };
 
 /* Apps which use randr/vidmode to change the mode when going fullscreen,

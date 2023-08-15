@@ -35,6 +35,9 @@
 #include <sys/stat.h>
 #include <xf86drm.h>
 #include <drm_fourcc.h>
+#include <linux/dma-buf.h>
+#include <linux/sync_file.h>
+#include <sys/ioctl.h>
 
 #define MESA_EGL_NO_X11_HEADERS
 #define EGL_NO_X11
@@ -51,6 +54,7 @@
 #include "xwayland-screen.h"
 
 #include "linux-dmabuf-unstable-v1-client-protocol.h"
+#include "linux-drm-syncobj-v1-client-protocol.h"
 
 struct xwl_gbm_private {
     drmDevice *device;
@@ -554,6 +558,28 @@ xwl_glamor_gbm_get_wl_buffer_for_pixmap(PixmapPtr pixmap)
 }
 
 static void
+xwl_screen_destroy_explicit_sync(struct xwl_screen *xwl_screen)
+{
+    if (xwl_screen->glamor_syncobj) {
+        xwl_screen->glamor_syncobj->free(xwl_screen->glamor_syncobj);
+        xwl_screen->glamor_syncobj = NULL;
+    }
+
+    if (xwl_screen->server_syncobj) {
+        xwl_screen->server_syncobj->free(xwl_screen->server_syncobj);
+        xwl_screen->server_syncobj = NULL;
+    }
+
+    if (xwl_screen->explicit_sync) {
+        wp_linux_drm_syncobj_v1_destroy(xwl_screen->explicit_sync);
+        xwl_screen->explicit_sync = NULL;
+    }
+
+    xwl_screen->glamor_timeline_point = 0;
+    xwl_screen->server_timeline_point = 0;
+}
+
+static void
 xwl_glamor_gbm_cleanup(struct xwl_screen *xwl_screen)
 {
     struct xwl_gbm_private *xwl_gbm = xwl_gbm_get(xwl_screen);
@@ -567,6 +593,7 @@ xwl_glamor_gbm_cleanup(struct xwl_screen *xwl_screen)
         wl_drm_destroy(xwl_gbm->drm);
     if (xwl_gbm->gbm)
         gbm_device_destroy(xwl_gbm->gbm);
+    xwl_screen_destroy_explicit_sync(xwl_screen);
 
     free(xwl_gbm);
 }
@@ -811,11 +838,87 @@ glamor_egl_fd_from_pixmap(ScreenPtr screen, PixmapPtr pixmap,
     return -1;
 }
 
+static int xwl_glamor_gbm_dmabuf_export_sync_file(PixmapPtr pixmap)
+{
+    struct xwl_pixmap *xwl_pixmap = xwl_pixmap_get(pixmap);
+    int num_planes = gbm_bo_get_plane_count(xwl_pixmap->bo);
+    int sync_file = -1;
+    int p;
+
+    for (p = 0; p < num_planes; ++p) {
+        int plane_fd = gbm_bo_get_fd_for_plane(xwl_pixmap->bo, p);
+        struct dma_buf_export_sync_file export_args = { 0 };
+        export_args.fd = -1;
+        export_args.flags = DMA_BUF_SYNC_READ;
+        drmIoctl(plane_fd, DMA_BUF_IOCTL_EXPORT_SYNC_FILE, &export_args);
+        close(plane_fd);
+        if (sync_file == -1) {
+            sync_file = export_args.fd;
+        } else {
+            struct sync_merge_data merge_args = { 0 };
+            merge_args.fd2 = export_args.fd;
+            ioctl(sync_file, SYNC_IOC_MERGE, &merge_args);
+            close(export_args.fd);
+            close(sync_file);
+            sync_file = merge_args.fence;
+        }
+    }
+
+    return sync_file;
+}
+
+static void xwl_glamor_gbm_dmabuf_import_sync_file(PixmapPtr pixmap, int sync_file)
+{
+    struct xwl_pixmap *xwl_pixmap = xwl_pixmap_get(pixmap);
+    int num_planes = gbm_bo_get_plane_count(xwl_pixmap->bo);
+    int p;
+
+    for (p = 0; p < num_planes; ++p) {
+        int plane_fd = gbm_bo_get_fd_for_plane(xwl_pixmap->bo, p);
+        struct dma_buf_import_sync_file import_args = { 0 };
+        import_args.fd = sync_file;
+        import_args.flags = DMA_BUF_SYNC_READ;
+        drmIoctl(plane_fd, DMA_BUF_IOCTL_IMPORT_SYNC_FILE, &import_args);
+        close(plane_fd);
+    }
+    close(sync_file);
+}
+
 struct xwl_dri3_syncobj
 {
     struct dri3_syncobj base;
     uint32_t handle;
+    struct wp_linux_drm_syncobj_timeline_v1 *timeline;
 };
+
+static void
+xwl_glamor_gbm_dri3_syncobj_passthrough(WindowPtr window,
+                                        struct dri3_syncobj *acquire_syncobj,
+                                        struct dri3_syncobj *release_syncobj,
+                                        uint64_t acquire_point,
+                                        uint64_t release_point)
+{
+    struct xwl_window *xwl_window = xwl_window_get(window);
+    struct xwl_screen *xwl_screen = xwl_window->xwl_screen;
+    struct xwl_dri3_syncobj *xwl_acquire_syncobj = (struct xwl_dri3_syncobj *)acquire_syncobj;
+    struct xwl_dri3_syncobj *xwl_release_syncobj = (struct xwl_dri3_syncobj *)release_syncobj;
+    uint32_t acquire_hi = acquire_point >> 32;
+    uint32_t acquire_lo = acquire_point & 0xffffffff;
+    uint32_t release_hi = release_point >> 32;
+    uint32_t release_lo = release_point & 0xffffffff;
+
+    if (!xwl_window->surface_sync)
+        xwl_window->surface_sync =
+            wp_linux_drm_syncobj_v1_get_surface(xwl_screen->explicit_sync,
+                                                xwl_window->surface);
+
+    wp_linux_drm_syncobj_surface_v1_set_acquire_point(xwl_window->surface_sync,
+                                                      xwl_acquire_syncobj->timeline,
+                                                      acquire_hi, acquire_lo);
+    wp_linux_drm_syncobj_surface_v1_set_release_point(xwl_window->surface_sync,
+                                                      xwl_release_syncobj->timeline,
+                                                      release_hi, release_lo);
+}
 
 static Bool
 xwl_dri3_check_syncobj(struct dri3_syncobj *syncobj, uint64_t point)
@@ -903,6 +1006,9 @@ xwl_dri3_free_syncobj(struct dri3_syncobj *syncobj)
     struct xwl_screen *xwl_screen = xwl_screen_get(syncobj->screen);
     struct xwl_gbm_private *xwl_gbm = xwl_gbm_get(xwl_screen);
 
+    if (xwl_syncobj->timeline)
+        wp_linux_drm_syncobj_timeline_v1_destroy(xwl_syncobj->timeline);
+
     if (xwl_syncobj->handle)
         drmSyncobjDestroy(xwl_gbm->drm_fd, xwl_syncobj->handle);
 
@@ -926,9 +1032,22 @@ xwl_dri3_create_syncobj(struct xwl_screen *xwl_screen, uint32_t handle)
 {
     struct xwl_dri3_syncobj *syncobj = calloc(1, sizeof (*syncobj));
     struct xwl_gbm_private *xwl_gbm = xwl_gbm_get(xwl_screen);
+    int syncobj_fd = -1;
 
     if (!syncobj)
         return NULL;
+
+    if (xwl_screen->explicit_sync) {
+        if (drmSyncobjHandleToFD(xwl_gbm->drm_fd, handle, &syncobj_fd))
+            goto fail;
+
+        syncobj->timeline =
+            wp_linux_drm_syncobj_v1_import_timeline(xwl_screen->explicit_sync,
+                                                    syncobj_fd);
+        close(syncobj_fd);
+        if (!syncobj->timeline)
+            goto fail;
+    }
 
     syncobj->handle = handle;
     syncobj->base.screen = xwl_screen->screen;
@@ -984,6 +1103,29 @@ xwl_gbm_supports_syncobjs(struct xwl_screen *xwl_screen)
     if (errno != ENOENT)
         return FALSE;
 
+    return TRUE;
+}
+
+static Bool
+xwl_screen_init_explicit_sync(struct xwl_screen *xwl_screen)
+{
+    struct xwl_gbm_private *xwl_gbm = xwl_gbm_get(xwl_screen);
+    uint32_t glamor_syncobj_handle, server_syncobj_handle;
+
+    if (!xwl_screen->explicit_sync)
+        return FALSE;
+
+    if (drmSyncobjCreate(xwl_gbm->drm_fd, 0, &glamor_syncobj_handle) ||
+        drmSyncobjCreate(xwl_gbm->drm_fd, 0, &server_syncobj_handle))
+        return FALSE;
+
+    xwl_screen->glamor_syncobj = xwl_dri3_create_syncobj(xwl_screen, glamor_syncobj_handle);
+    xwl_screen->server_syncobj = xwl_dri3_create_syncobj(xwl_screen, server_syncobj_handle);
+    if (!xwl_screen->glamor_syncobj || !xwl_screen->server_syncobj)
+        return FALSE;
+
+    xwl_screen->glamor_timeline_point = 1;
+    xwl_screen->server_timeline_point = 1;
     return TRUE;
 }
 
@@ -1158,6 +1300,11 @@ xwl_glamor_gbm_init_wl_registry(struct xwl_screen *xwl_screen,
     } else if (strcmp(name, "zwp_linux_dmabuf_v1") == 0) {
         xwl_screen_set_dmabuf_interface(xwl_screen, id, version);
         return TRUE;
+    } else if (strcmp(name, "wp_linux_drm_syncobj_v1") == 0) {
+        xwl_screen->explicit_sync =
+            wl_registry_bind(xwl_screen->registry, id,
+                             &wp_linux_drm_syncobj_v1_interface,
+                             version);
     }
 
     /* no match */
@@ -1281,7 +1428,7 @@ xwl_glamor_gbm_init_egl(struct xwl_screen *xwl_screen)
     struct xwl_gbm_private *xwl_gbm = xwl_gbm_get(xwl_screen);
     EGLint major, minor;
     const GLubyte *renderer;
-    const char *gbm_backend_name;
+    const char *gbm_backend_name, *egl_vendor;
 
     if (!xwl_gbm->fd_render_node && !xwl_gbm->drm_authenticated) {
         ErrorF("Failed to get wl_drm, disabling Glamor and DRI3\n");
@@ -1342,6 +1489,22 @@ xwl_glamor_gbm_init_egl(struct xwl_screen *xwl_screen)
     if (gbm_backend_name && strcmp(gbm_backend_name, "drm") != 0)
         xwl_screen->glvnd_vendor = gbm_backend_name;
 
+    egl_vendor = eglQueryString(xwl_screen->egl_display, EGL_VENDOR);
+    /* NVIDIA driver does not support implicit sync */
+    if (egl_vendor && strstr(egl_vendor, "NVIDIA"))
+        xwl_screen->gbm_backend.backend_flags &=
+            ~XWL_EGL_BACKEND_SUPPORTS_IMPLICIT_SYNC;
+
+    if (xwl_gbm_supports_syncobjs(xwl_screen) &&
+        epoxy_has_egl_extension(xwl_screen->egl_display,
+                                "ANDROID_native_fence_sync"))
+        xwl_screen->gbm_backend.backend_flags |=
+            XWL_EGL_BACKEND_SUPPORTS_SYNCOBJS;
+
+    if (!xwl_glamor_supports_syncobjs(xwl_screen) ||
+        !xwl_screen_init_explicit_sync(xwl_screen))
+        xwl_screen_destroy_explicit_sync(xwl_screen);
+
     return TRUE;
 error:
     if (xwl_screen->egl_display != EGL_NO_DISPLAY) {
@@ -1359,7 +1522,7 @@ xwl_glamor_gbm_init_screen(struct xwl_screen *xwl_screen)
 {
     struct xwl_gbm_private *xwl_gbm = xwl_gbm_get(xwl_screen);
 
-    if (xwl_gbm_supports_syncobjs(xwl_screen)) {
+    if (xwl_glamor_supports_syncobjs(xwl_screen)) {
         xwl_dri3_info.version = 4;
         xwl_dri3_info.import_syncobj = xwl_dri3_import_syncobj;
     }
@@ -1432,6 +1595,11 @@ xwl_glamor_init_gbm(struct xwl_screen *xwl_screen)
     xwl_screen->gbm_backend.get_main_device = xwl_gbm_get_main_device;
     xwl_screen->gbm_backend.is_available = TRUE;
     xwl_screen->gbm_backend.backend_flags = XWL_EGL_BACKEND_NEEDS_BUFFER_FLUSH |
-                                            XWL_EGL_BACKEND_NEEDS_N_BUFFERING;
+                                            XWL_EGL_BACKEND_NEEDS_N_BUFFERING |
+                                            /* may be overriden during EGL initialization */
+                                            XWL_EGL_BACKEND_SUPPORTS_IMPLICIT_SYNC;
     xwl_screen->gbm_backend.create_pixmap_for_window = xwl_glamor_gbm_create_pixmap_for_window;
+    xwl_screen->gbm_backend.dmabuf_export_sync_file = xwl_glamor_gbm_dmabuf_export_sync_file;
+    xwl_screen->gbm_backend.dmabuf_import_sync_file = xwl_glamor_gbm_dmabuf_import_sync_file;
+    xwl_screen->gbm_backend.dri3_syncobj_passthrough = xwl_glamor_gbm_dri3_syncobj_passthrough;
 }

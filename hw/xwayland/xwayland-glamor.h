@@ -34,11 +34,14 @@
 #include <xf86drm.h>
 
 #include "xwayland-types.h"
+#include "dri3.h"
 
 typedef enum _xwl_egl_backend_flags {
     XWL_EGL_BACKEND_NO_FLAG = 0,
     XWL_EGL_BACKEND_NEEDS_BUFFER_FLUSH = (1 << 0),
     XWL_EGL_BACKEND_NEEDS_N_BUFFERING = (1 << 1),
+    XWL_EGL_BACKEND_SUPPORTS_IMPLICIT_SYNC = (1 << 2),
+    XWL_EGL_BACKEND_SUPPORTS_SYNCOBJS = (1 << 3),
 } xwl_egl_backend_flags;
 
 struct xwl_egl_backend {
@@ -107,6 +110,19 @@ struct xwl_egl_backend {
 
     /* Direct hook to create the backing pixmap for a window */
     PixmapPtr (*create_pixmap_for_window)(struct xwl_window *xwl_window);
+
+    /* Merge the implicit read fences of each plane into a sync file */
+    int (*dmabuf_export_sync_file)(PixmapPtr pixmap);
+
+    /* Sets the implicit read fence of each plane to the given sync file */
+    void (*dmabuf_import_sync_file)(PixmapPtr pixmap, int sync_file);
+
+    /* Sets the explicit sync acquire and release points for the given Window */
+    void (*dri3_syncobj_passthrough)(WindowPtr window,
+                                     struct dri3_syncobj *acquire_syncobj,
+                                     struct dri3_syncobj *release_syncobj,
+                                     uint64_t acquire_point,
+                                     uint64_t release_point);
 };
 
 #ifdef XWL_HAS_GLAMOR
@@ -135,6 +151,8 @@ Bool xwl_glamor_allow_commits(struct xwl_window *xwl_window);
 void xwl_glamor_egl_make_current(struct xwl_screen *xwl_screen);
 Bool xwl_glamor_needs_buffer_flush(struct xwl_screen *xwl_screen);
 Bool xwl_glamor_needs_n_buffering(struct xwl_screen *xwl_screen);
+Bool xwl_glamor_supports_implicit_sync(struct xwl_screen *xwl_screen);
+Bool xwl_glamor_supports_syncobjs(struct xwl_screen *xwl_screen);
 Bool xwl_glamor_is_modifier_supported(struct xwl_screen *xwl_screen,
                                       uint32_t format, uint64_t modifier);
 uint32_t wl_drm_format_for_depth(int depth);
@@ -152,6 +170,14 @@ Bool xwl_glamor_get_drawable_modifiers(DrawablePtr drawable, uint32_t format,
 Bool xwl_glamor_check_flip(WindowPtr present_window, PixmapPtr pixmap);
 PixmapPtr xwl_glamor_create_pixmap_for_window (struct xwl_window *xwl_window);
 int xwl_glamor_get_fence(struct xwl_screen *screen);
+void xwl_glamor_wait_fence(struct xwl_screen *xwl_screen, int fence);
+int xwl_glamor_dmabuf_export_sync_file(PixmapPtr pixmap);
+void xwl_glamor_dmabuf_import_sync_file(PixmapPtr pixmap, int sync_file);
+void xwl_glamor_dri3_syncobj_passthrough(WindowPtr window,
+                                         struct dri3_syncobj *acquire_syncobj,
+                                         struct dri3_syncobj *release_syncobj,
+                                         uint64_t acquire_point,
+                                         uint64_t release_point);
 
 #ifdef XV
 /* glamor Xv Adaptor */

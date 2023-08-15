@@ -64,6 +64,7 @@
 #include "xdg-shell-client-protocol.h"
 #include "xwayland-shell-v1-client-protocol.h"
 #include "tearing-control-v1-client-protocol.h"
+#include "linux-drm-syncobj-v1-client-protocol.h"
 
 static DevPrivateKeyRec xwl_screen_private_key;
 static DevPrivateKeyRec xwl_client_private_key;

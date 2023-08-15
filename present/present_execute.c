@@ -75,8 +75,11 @@ present_execute_wait(present_vblank_ptr vblank, uint64_t crtc_msc)
         }
     }
 
-    if (vblank->acquire_syncobj && !vblank->acquire_syncobj->check(vblank->acquire_syncobj,
-                                                                   vblank->acquire_point)) {
+    /* Defer execution of explicitly synchronized copies.
+     * Flip synchronization is managed by the driver.
+     */
+    if (!vblank->flip && vblank->acquire_syncobj &&
+        !vblank->acquire_syncobj->check(vblank->acquire_syncobj, vblank->acquire_point)) {
         vblank->efd = eventfd(0, EFD_CLOEXEC);
         SetNotifyFd(vblank->efd, present_syncobj_triggered, X_NOTIFY_READ, vblank);
         vblank->acquire_syncobj->eventfd(vblank->acquire_syncobj, vblank->acquire_point,

@@ -32,6 +32,13 @@
 #include "xwayland-pixmap.h"
 #include "xwayland-screen.h"
 #include "xwayland-window-buffers.h"
+#include "dri3.h"
+#ifdef XWL_HAS_GLAMOR
+#include "glamor.h"
+#endif
+
+#include <poll.h>
+#include <sys/eventfd.h>
 
 #define BUFFER_TIMEOUT 1 * 1000 /* ms */
 
@@ -40,6 +47,8 @@ struct xwl_window_buffer {
     PixmapPtr pixmap;
     RegionPtr damage_region;
     Bool recycle_on_release;
+    uint64_t release_point;
+    int sync_fd;
     int refcnt;
     uint32_t time;
     struct xorg_list link_buffer;
@@ -80,6 +89,7 @@ xwl_window_buffer_new(struct xwl_window *xwl_window)
     xwl_window_buffer->xwl_window = xwl_window;
     xwl_window_buffer->damage_region = RegionCreate(NullBox, 1);
     xwl_window_buffer->pixmap = NullPixmap;
+    xwl_window_buffer->sync_fd = -1;
     xwl_window_buffer->refcnt = 1;
 
     xorg_list_append(&xwl_window_buffer->link_buffer,
@@ -110,6 +120,9 @@ xwl_window_buffer_dispose(struct xwl_window_buffer *xwl_window_buffer)
 
     if (xwl_window_buffer->pixmap)
         xwl_window_buffer_destroy_pixmap (xwl_window_buffer);
+
+    if (xwl_window_buffer->sync_fd >= 0)
+        close(xwl_window_buffer->sync_fd);
 
     xorg_list_del(&xwl_window_buffer->link_buffer);
     free(xwl_window_buffer);
@@ -194,6 +207,7 @@ xwl_window_buffer_release_callback(void *data)
 {
     struct xwl_window_buffer *xwl_window_buffer = data;
     struct xwl_window *xwl_window = xwl_window_buffer->xwl_window;
+    struct xwl_screen *xwl_screen = xwl_window->xwl_screen;
     struct xwl_window_buffer *oldest_available_buffer;
 
     /* Drop the reference on the buffer we took in get_pixmap. If that
@@ -220,6 +234,14 @@ xwl_window_buffer_release_callback(void *data)
         xorg_list_first_entry(&xwl_window->window_buffers_available,
                              struct xwl_window_buffer,
                              link_buffer);
+
+    if (xwl_window_buffer->release_point) {
+        /* We will wait for this fence before re-using the buffer */
+        xwl_window_buffer->sync_fd =
+            xwl_screen->server_syncobj->export_fence(xwl_screen->server_syncobj,
+                                                     xwl_window_buffer->release_point);
+        xwl_window_buffer->release_point = 0;
+    }
 
     /* Schedule next timer based on time of the oldest buffer */
     xwl_window->window_buffers_timer =
@@ -289,6 +311,34 @@ xwl_window_buffers_dispose(struct xwl_window *xwl_window)
     }
 }
 
+static void
+xwl_window_buffers_set_syncpts(struct xwl_window_buffer *xwl_window_buffer)
+{
+    struct xwl_window *xwl_window = xwl_window_buffer->xwl_window;
+    struct xwl_screen *xwl_screen = xwl_window->xwl_screen;
+    uint64_t acquire_point = xwl_screen->glamor_timeline_point++;
+    uint64_t release_point = xwl_screen->server_timeline_point++;
+
+    int fence_fd = xwl_glamor_get_fence(xwl_screen);
+    if (fence_fd >= 0) {
+        xwl_screen->glamor_syncobj->import_fence(xwl_screen->glamor_syncobj,
+                                                 acquire_point, fence_fd);
+    } else {
+#ifdef XWL_HAS_GLAMOR
+        glamor_finish(xwl_screen->screen);
+#endif /* XWL_HAS_GLAMOR */
+        xwl_screen->glamor_syncobj->signal(xwl_screen->glamor_syncobj,
+                                           acquire_point);
+    }
+
+    xwl_window_buffer->release_point = release_point;
+    xwl_glamor_dri3_syncobj_passthrough(xwl_window->window,
+                                        xwl_screen->glamor_syncobj,
+                                        xwl_screen->server_syncobj,
+                                        acquire_point,
+                                        release_point);
+}
+
 PixmapPtr
 xwl_window_buffers_get_pixmap(struct xwl_window *xwl_window,
                               RegionPtr damage_region)
@@ -312,6 +362,14 @@ xwl_window_buffers_get_pixmap(struct xwl_window *xwl_window,
     xwl_window_buffer_add_damage_region(xwl_window, damage_region);
 
     full_damage = xwl_window_buffer->damage_region;
+
+#ifdef XWL_HAS_GLAMOR
+    if (xwl_window_buffer->sync_fd >= 0) {
+        xwl_glamor_wait_fence(xwl_screen, xwl_window_buffer->sync_fd);
+        close(xwl_window_buffer->sync_fd);
+        xwl_window_buffer->sync_fd = -1;
+    }
+#endif /* XWL_HAS_GLAMOR */
 
     if (xwl_window_buffer->pixmap) {
         BoxPtr pBox = RegionRects(full_damage);
@@ -359,6 +417,16 @@ xwl_window_buffers_get_pixmap(struct xwl_window *xwl_window,
 
     /* Hold a reference on the buffer until it's released by the compositor */
     xwl_window_buffer->refcnt++;
+
+#ifdef XWL_HAS_GLAMOR
+    if (!xwl_glamor_supports_implicit_sync(xwl_screen)) {
+        if (xwl_screen->explicit_sync)
+            xwl_window_buffers_set_syncpts(xwl_window_buffer);
+        else
+            glamor_finish(xwl_screen->screen);
+    }
+#endif /* XWL_HAS_GLAMOR */
+
     xwl_pixmap_set_buffer_release_cb(xwl_window_buffer->pixmap,
                                      xwl_window_buffer_release_callback,
                                      xwl_window_buffer);

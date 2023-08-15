@@ -50,6 +50,7 @@
 #include "viewporter-client-protocol.h"
 #include "xdg-shell-client-protocol.h"
 #include "xwayland-shell-v1-client-protocol.h"
+#include "linux-drm-syncobj-v1-client-protocol.h"
 
 #define DELAYED_WL_SURFACE_DESTROY 1000 /* ms */
 
@@ -1149,6 +1150,9 @@ xwl_unrealize_window(WindowPtr window)
     if (xwl_window->tearing_control)
         wp_tearing_control_v1_destroy(xwl_window->tearing_control);
 
+    if (xwl_window->surface_sync)
+        wp_linux_drm_syncobj_surface_v1_destroy(xwl_window->surface_sync);
+
     release_wl_surface_for_window(xwl_window);
     xorg_list_del(&xwl_window->link_damage);
     xorg_list_del(&xwl_window->link_window);
@@ -1354,6 +1358,13 @@ xwl_window_attach_buffer(struct xwl_window *xwl_window)
     pixmap = xwl_window_buffers_get_pixmap(xwl_window, region);
 
 #ifdef XWL_HAS_GLAMOR
+    if (xwl_glamor_supports_implicit_sync(xwl_screen) &&
+        xwl_window->surface_sync) {
+        /* prefer implicit sync when possible */
+        wp_linux_drm_syncobj_surface_v1_destroy(xwl_window->surface_sync);
+        xwl_window->surface_sync = NULL;
+    }
+
     if (xwl_screen->glamor)
         buffer = xwl_glamor_pixmap_get_wl_buffer(pixmap);
     else
